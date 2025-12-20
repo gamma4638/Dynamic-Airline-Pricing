@@ -71,7 +71,7 @@ class Simulator:
             actions.append(p_t)
 
             # 환경 스텝 실행
-            result = self.model.step(c_t, p_t, self.rng)
+            result = self.model.step(c_t, p_t, self.rng, t=t)
 
             arrivals.append(result['M_t'])
             sales.append(result['s_t'])
@@ -198,6 +198,19 @@ Examples:
         default=1,
         help='시나리오 선택: 1(인천-뉴욕, 비즈니스), 2(인천-호놀룰루, 레저) (기본: 1)'
     )
+    parser.add_argument(
+        '--n-simulations',
+        type=int,
+        default=100,
+        help='Rollout 시뮬레이션 횟수 (기본: 100)'
+    )
+    parser.add_argument(
+        '--rollout-base',
+        type=str,
+        choices=['fixed', 'greedy'],
+        default='fixed',
+        help='Rollout base policy (기본: fixed)'
+    )
     args = parser.parse_args()
 
     # 저장 경로 설정
@@ -295,15 +308,21 @@ Examples:
         print(f"  Initial Value V(0, {model.num_seats}): {policy.get_value(model.num_seats, 0):,.0f}")
 
     elif args.policy == 'rollout':
-        base_policy = FixedPricePolicy(fixed_price=args.fixed_price)
+        if args.rollout_base == 'fixed':
+            base_policy = FixedPricePolicy(fixed_price=args.fixed_price)
+            base_name = f"Fixed({args.fixed_price})"
+        else:
+            base_policy = GreedyPolicy(model=model)
+            base_name = "Greedy"
+
         policy = RolloutPolicy(
             model=model,
             base_policy=base_policy,
-            n_simulations=100,
+            n_simulations=args.n_simulations,
             rollout_depth=model.num_stages,
             seed=args.seed
         )
-        policy_name = f"Rollout(base=Fixed({args.fixed_price}))"
+        policy_name = f"Rollout(base={base_name}, N={args.n_simulations})"
 
     else:
         raise ValueError(f"Unknown policy: {args.policy}")
