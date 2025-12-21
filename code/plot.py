@@ -237,3 +237,42 @@ def plot_policy_3d(policy_table: np.ndarray, title: str = "Policy 3D Surface",
         plt.savefig(save_path, dpi=150)
         print(f"Saved: {save_path}")
     plt.close()
+
+
+def show_policy_3d_interactive(policy_table: np.ndarray, title: str = "Policy 3D Surface"):
+    """
+    정책 테이블 3D surface 인터랙티브 시각화
+    - 마우스 드래그로 회전
+    - GUI 창에서 직접 PNG 저장 가능 (툴바의 저장 버튼)
+
+    Args:
+        policy_table: (T, nS) 배열, policy_table[t, c] = 가격
+        title: 그래프 제목
+    """
+    plt.switch_backend('TkAgg')  # GUI 백엔드로 전환
+    from mpl_toolkits.mplot3d import Axes3D
+
+    T, nS = policy_table.shape
+
+    # c=0 (좌석 없음) 제외
+    policy_to_plot = policy_table[:, 1:].copy()
+    t_range = np.arange(T)
+    c_range = np.arange(1, nS)
+    T_grid, C_grid = np.meshgrid(t_range, c_range)
+
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    surf = ax.plot_surface(T_grid, C_grid, policy_to_plot.T,
+                           cmap='viridis', edgecolor='none', alpha=0.8)
+
+    ax.set_xlabel('Time (t)')
+    ax.set_ylabel('Remaining Seats (c)')
+    ax.set_zlabel('Price')
+    ax.set_title(title)
+
+    fig.colorbar(surf, ax=ax, shrink=0.5, aspect=10, label='Price')
+
+    plt.tight_layout()
+    print("Interactive 3D plot opened. Drag to rotate, use toolbar to save.")
+    plt.show()

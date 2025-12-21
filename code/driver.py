@@ -15,6 +15,7 @@ from policy import (
     GreedyPolicy,
     BackwardInductionPolicy,
     RolloutPolicy,
+    generate_policy_table,
 )
 from plot import plot_episode, plot_statistics, plot_policy_comparison, plot_policy_3d, plot_policy_heatmap
 
@@ -71,13 +72,17 @@ class Simulator:
             actions.append(p_t)
 
             # 환경 스텝 실행
-            result = self.model.step(c_t, p_t, self.rng, t=t)
+            result = self.model.step(c_t, p_t, self.rng)
 
             arrivals.append(result['M_t'])
             sales.append(result['s_t'])
             rewards.append(result['r_t'])
             c_t = result['c_next']
             states.append(c_t)
+
+        # Rollout 정책의 verbose 출력 후 줄바꿈
+        if hasattr(self.policy, 'verbose') and self.policy.verbose:
+            print()  # 줄바꿈
 
         return {
             'states': np.array(states),
@@ -144,6 +149,34 @@ class Simulator:
         }
 
 
+def create_base_policy(policy_type: str, model, fixed_price: float):
+    """
+    Rollout용 base policy 생성
+
+    Args:
+        policy_type: 정책 타입 ('fixed', 'greedy', 'dp')
+        model: AirlinePricingModel 인스턴스
+        fixed_price: FixedPricePolicy용 가격
+
+    Returns:
+        (policy, name): 정책 인스턴스와 이름 튜플
+    """
+    if policy_type == 'fixed':
+        return FixedPricePolicy(fixed_price=fixed_price), f"Fixed({fixed_price})"
+
+    elif policy_type == 'greedy':
+        return GreedyPolicy(model=model), "Greedy"
+
+    elif policy_type == 'dp':
+        print("  Solving DP for base policy...")
+        policy = BackwardInductionPolicy(model=model, gamma=1.0, verbose=False)
+        policy.solve()
+        return policy, "DP"
+
+    else:
+        raise ValueError(f"Unknown base policy: {policy_type}")
+
+
 # ========== 메인 실행 ==========
 def main():
     parser = argparse.ArgumentParser(
@@ -207,9 +240,15 @@ Examples:
     parser.add_argument(
         '--rollout-base',
         type=str,
-        choices=['fixed', 'greedy'],
+        choices=['fixed', 'greedy', 'dp'],
         default='fixed',
-        help='Rollout base policy (기본: fixed)'
+        help='Rollout base policy: fixed, greedy, dp (기본: fixed)'
+    )
+    parser.add_argument(
+        '--rollout-depth',
+        type=int,
+        default=None,
+        help='Rollout lookahead depth (기본: None = 전체 horizon)'
     )
     args = parser.parse_args()
 
@@ -222,19 +261,21 @@ Examples:
     # 시나리오 1: 인천-뉴욕 노선 (비즈니스 수요)
     # - 높은 가격대, 낮은 가격 탄력성(-1.2), 낮은 구매 포기율(5%)
     model_params1 = {
-        'num_seats': 600,
+        'num_seats': 1200,
         'num_stages': 90,
-        'price_min': 8.0,      # 단위: 십만원
-        'price_max': 18.0,
-        'price_step': 1.0,
-        'demand_multiplier': 2.5,  # 지수 수요 모델: A = seats * multiplier
-        'demand_beta': 0.03,       # 지수 수요 모델: 감쇠율
-        'v_me': 5.56,           # V₁: 자사 효용
-        'v_comp': 4.98,         # V₂: 경쟁사 효용
+        'price_min': 1.0,      # 단위: 십만원
+        'price_max': 30.0,
+        'price_step': 0.1,
+        'total_expected_demand': 8000,  # 총 기대 도착 수 (좌석과 독립)
+        'demand_beta': 0.0,             # 균일 수요 (0이면 매일 동일)
+        'v_me': 8.5,           # V₁: 자사 효용
+        'v_comp': 7.92,         # V₂: 경쟁사 효용
         'v_no_buy': 0.0,        # V₀: 구매 포기 효용 (기준점)
-        'beta': 0.204,          # 가격 민감도
-        'p_comp_min': 5.0,      # 경쟁사 최소 가격 (t=0)
-        'p_comp_max': 15.0,     # 경쟁사 최대 가격 (t=T-1)
+        'beta': 0.6,           # 초기 가격 민감도 (t=0)
+        'beta_final': 0.2,     # 최종 가격 민감도 (t=T-1, 마지막에 덜 민감)
+        'beta_decay': 3.0,     # 가격 민감도 감소 속도 (지수적 감소)
+        'p_comp_min': 8.0,      # 경쟁사 최소 가격 (t=0)
+        'p_comp_max': 18.0,     # 경쟁사 최대 가격 (t=T-1)
     }
 
     # 시나리오 2: 인천-호놀룰루 노선 (레저 수요)
@@ -242,15 +283,17 @@ Examples:
     model_params2 = {
         'num_seats': 600,
         'num_stages': 90,
-        'price_min': 6.0,       # 단위: 십만원
-        'price_max': 10.0,
+        'price_min': 8.0,       # 단위: 십만원
+        'price_max': 18.0,
         'price_step': 0.5,
-        'demand_multiplier': 2.5,  # 지수 수요 모델: A = seats * multiplier
-        'demand_beta': 0.03,       # 지수 수요 모델: 감쇠율
+        'total_expected_demand': 1800,  # 총 기대 도착 수 (좌석과 독립)
+        'demand_beta': 0.0,             # 균일 수요 (0이면 매일 동일)
         'v_me': 2.04,           # V₁: 자사 효용
         'v_comp': 1.14,         # V₂: 경쟁사 효용
         'v_no_buy': 0.0,        # V₀: 구매 포기 효용 (기준점)
-        'beta': 0.191,          # 가격 민감도
+        'beta': 0.3,           # 초기 가격 민감도 (t=0)
+        'beta_final': 0.1,     # 최종 가격 민감도 (t=T-1, 마지막에 덜 민감)
+        'beta_decay': 3.0,     # 가격 민감도 감소 속도 (지수적 감소)
         'p_comp_min': 5.0,      # 경쟁사 최소 가격 (t=0)
         'p_comp_max': 15.0,     # 경쟁사 최대 가격 (t=T-1)
     }
@@ -279,8 +322,8 @@ Examples:
     print(f"  Price Range: {model.price_min} ~ {model.price_max} (십만원)")
     print(f"  Action Space: {model.action_space}")
     print(f"  V_me: {model.v_me}, V_comp: {model.v_comp}, V_no_buy: {model.v_no_buy}")
-    print(f"  Beta (가격 민감도): {model.beta}")
-    print(f"  Demand Model: exponential (multiplier={model.demand_multiplier}, beta={model.demand_beta})")
+    print(f"  Beta (가격 민감도): {model.beta} → {model.beta_final} (decay={model.beta_decay})")
+    print(f"  Demand Model: exponential (total_demand={model.total_expected_demand}, beta={model.demand_beta})")
     print(f"  Expected Arrivals: t=0: {model.get_expected_arrivals(0):.1f}, t=89: {model.get_expected_arrivals(89):.1f}")
     print(f"  Competitor Price: {model.p_comp_min} ~ {model.p_comp_max} (동적)")
     print("=" * 50)
@@ -291,38 +334,45 @@ Examples:
     if args.policy == 'fixed':
         policy = FixedPricePolicy(fixed_price=args.fixed_price)
         policy_name = f"Fixed({args.fixed_price})"
+        policy_suffix = "fixed"
 
     elif args.policy == 'random':
         policy = RandomPolicy(action_space=model.action_space, seed=args.seed)
         policy_name = "Random"
+        policy_suffix = "random"
 
     elif args.policy == 'greedy':
         policy = GreedyPolicy(model=model)
         policy_name = "Greedy"
+        policy_suffix = "greedy"
 
     elif args.policy == 'dp':
         print("  Running Backward Induction...")
         policy = BackwardInductionPolicy(model=model, gamma=1.0, verbose=True)
         policy.solve()
         policy_name = "DP (Backward Induction)"
+        policy_suffix = "dp"
         print(f"  Initial Value V(0, {model.num_seats}): {policy.get_value(model.num_seats, 0):,.0f}")
 
     elif args.policy == 'rollout':
-        if args.rollout_base == 'fixed':
-            base_policy = FixedPricePolicy(fixed_price=args.fixed_price)
-            base_name = f"Fixed({args.fixed_price})"
-        else:
-            base_policy = GreedyPolicy(model=model)
-            base_name = "Greedy"
+        # rollout_depth: 지정하지 않으면 전체 horizon
+        rollout_depth = args.rollout_depth if args.rollout_depth else model.num_stages
+
+        # base policy 생성
+        base_policy, base_name = create_base_policy(
+            args.rollout_base, model, args.fixed_price
+        )
 
         policy = RolloutPolicy(
             model=model,
             base_policy=base_policy,
             n_simulations=args.n_simulations,
-            rollout_depth=model.num_stages,
-            seed=args.seed
+            rollout_depth=rollout_depth,
+            seed=args.seed,
+            verbose=True
         )
-        policy_name = f"Rollout(base={base_name}, N={args.n_simulations})"
+        policy_name = f"Rollout(base={base_name}, N={args.n_simulations}, depth={rollout_depth})"
+        policy_suffix = "rollout"
 
     else:
         raise ValueError(f"Unknown policy: {args.policy}")
@@ -340,7 +390,7 @@ Examples:
         plot_episode(
             episode_result,
             title=f"Single Episode ({policy_name})",
-            save_path=os.path.join(fig_dir, 'episode_result.png')
+            save_path=os.path.join(fig_dir, f'episode_{policy_suffix}.png')
         )
 
     # 여러 에피소드
@@ -355,22 +405,27 @@ Examples:
         plot_statistics(
             stats,
             title=f"Simulation Statistics ({args.episodes} episodes, {policy_name})",
-            save_path=os.path.join(fig_dir, 'simulation_stats.png')
+            save_path=os.path.join(fig_dir, f'statistics_{policy_suffix}.png')
         )
 
-    # DP 정책인 경우 정책 테이블 시각화
-    if args.policy == 'dp':
+    # 정책 테이블 시각화 (Rollout 제외 - 계산 비용이 너무 큼)
+    if args.policy != 'rollout':
         print("\n[Policy Visualization]")
+        print("  Generating policy table...")
+        policy_table = generate_policy_table(policy, model, verbose=True)
+
         plot_policy_3d(
-            policy.policy_table,
-            title=f"Optimal Policy 3D ({policy_name})",
-            save_path=os.path.join(fig_dir, 'policy_3d.png')
+            policy_table,
+            title=f"Policy 3D ({policy_name})",
+            save_path=os.path.join(fig_dir, f'policy_3d_{policy_suffix}.png')
         )
         plot_policy_heatmap(
-            policy.policy_table,
-            title=f"Optimal Policy Heatmap ({policy_name})",
-            save_path=os.path.join(fig_dir, 'policy_heatmap.png')
+            policy_table,
+            title=f"Policy Heatmap ({policy_name})",
+            save_path=os.path.join(fig_dir, f'policy_heatmap_{policy_suffix}.png')
         )
+    else:
+        print("\n[Policy Visualization] Skipped for Rollout (too expensive)")
 
     print("\nDone!")
 

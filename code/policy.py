@@ -98,8 +98,8 @@ class GreedyPolicy(BasePolicy):
         mu_t = self.model.get_expected_arrivals(t)
 
         for p_t in self.model.action_space:
-            # 구매 확률 (동적 p_comp 사용)
-            prob = self.model.purchase_probability(p_t, p_comp)
+            # 구매 확률 (동적 p_comp, 시간별 beta 사용)
+            prob = self.model.purchase_probability(p_t, p_comp, t)
             # 기대 수요: E[Q] = mu_t * prob (시간별 mu)
             expected_demand = mu_t * prob
             # 기대 판매량 (좌석 제약)
@@ -197,7 +197,94 @@ class BackwardInductionPolicy(BasePolicy):
         self.value = np.zeros((T + 1, nS))
         self.policy_table = np.zeros((T, nS))
 
-        # 역순으로 계산 (t = T-1, T-2, ..., 0)
+        # Action Space를 미리 Numpy 배열로 변환
+        actions = self.model.action_space
+        n_actions = len(actions)
+        
+        # State 벡터 (0 ~ 600)
+        states = np.arange(nS)  # shape: (nS,)
+
+        # 역순 계산 (t = T-1 ... 0)
+        # 시간 t는 병렬화 불가 (직렬 진행)
+        for t in range(T - 1, -1, -1):
+            if self.verbose and t % 10 == 0:
+                print(f"  Solving t={t}")
+
+            # 1. 경쟁사 가격 & Poisson 확률 가져오기
+            p_comp = self.model.get_competitor_price(t, rng=None)
+            probs_M = self.poisson_probs_by_t[t] # shape: (M_max,)
+            
+            # 유의미한 확률을 가진 M만 골라내기 (속도 최적화)
+            valid_idx = probs_M > 1e-6
+            valid_Ms = self.M_range[valid_idx]
+            valid_probs_M = probs_M[valid_idx]
+
+            # 2. 모든 Action에 대한 구매 확률 계산 (Vectorized, 시간별 beta)
+            # shape: (n_actions,)
+            probs_buy = np.array([
+                self.model.purchase_probability(p, p_comp, t) for p in actions
+            ])
+
+            # 3. 기대 가치 테이블 초기화: [Action x State]
+            # 각 행동을 했을 때, 각 상태(좌석)별 기대 가치
+            expected_values = np.zeros((n_actions, nS))
+
+            # 4. '도착 수(M)'에 대해 루프 (여기는 루프가 작아서 괜찮음)
+            # 수식: Sum_M { P(M) * (Reward + Gamma * V_next) }
+            V_next = self.value[t + 1]  # 미래 가치 (nS,)
+
+            for M, prob_M in zip(valid_Ms, valid_probs_M):
+                if M == 0:
+                    # 손님이 안 오면: 보상 0 + 미래 가치 그대로 유지
+                    # 모든 Action에 대해 동일하게 미래 가치 더함
+                    expected_values += prob_M * (0 + self.gamma * V_next)
+                    continue
+
+                # 해당 M에서의 기대 수요 Q (실수)
+                # Q_a shape: (n_actions,)
+                Q_a = M * probs_buy 
+                
+                # 판매량은 정수로 반올림
+                sales_potential = np.round(Q_a).astype(int) # (n_actions,)
+                
+                # --- 여기가 핵심 벡터화 구간 ---
+                # sales_potential(행동별 판매가능량)과 states(현재 좌석)를 Broadcasting
+                # sales_matrix[a, s] = 행동 a를 했고 현재 좌석이 s일 때 실제 판매량
+                # shape: (n_actions, nS)
+                
+                # Broadcasting을 위해 차원 확장
+                sales_pot_col = sales_potential[:, np.newaxis] # (n_actions, 1)
+                states_row = states[np.newaxis, :]             # (1, nS)
+                
+                # 실제 판매량 = min(잠재수요, 현재좌석)
+                real_sales = np.minimum(sales_pot_col, states_row) # (n_actions, nS)
+                
+                # 즉시 보상 = 가격 * 판매량
+                # actions: (n_actions,) -> (n_actions, 1)
+                rewards = actions[:, np.newaxis] * real_sales
+                
+                # 다음 상태 = 현재좌석 - 판매량
+                next_states = states_row - real_sales # (n_actions, nS)
+                
+                # 미래 가치 가져오기 (Fancy Indexing)
+                future_vals = V_next[next_states]
+                
+                # 기대값 누적
+                expected_values += prob_M * (rewards + self.gamma * future_vals)
+
+            # 5. 최적 행동 선택 (각 State별로 Value가 가장 높은 Action 선택)
+            # axis=0 (Action 축)을 기준으로 Max값 찾기
+            best_action_indices = np.argmax(expected_values, axis=0)
+            
+            # 결과 저장
+            self.value[t] = expected_values[best_action_indices, np.arange(nS)]
+            self.policy_table[t] = actions[best_action_indices]
+            
+            # c=0인 경우 (좌석 없음) 강제 처리 (가격 의미 없음, 가치 0)
+            self.value[t, 0] = 0
+            self.policy_table[t, 0] = actions[0]
+
+        '''# 역순으로 계산 (t = T-1, T-2, ..., 0)
         for t in range(T - 1, -1, -1):
             if self.verbose:
                 print(f"  Solving t={t}/{T-1}")
@@ -220,7 +307,7 @@ class BackwardInductionPolicy(BasePolicy):
                         best_action = p_t
 
                 self.value[t, c] = best_value
-                self.policy_table[t, c] = best_action
+                self.policy_table[t, c] = best_action'''
 
         self._solved = True
         if self.verbose:
@@ -240,7 +327,7 @@ class BackwardInductionPolicy(BasePolicy):
         """
         # 시점 t의 기대 경쟁사 가격 (노이즈 없이)
         p_comp = self.model.get_competitor_price(t, rng=None)
-        prob_buy = self.model.purchase_probability(p_t, p_comp)
+        prob_buy = self.model.purchase_probability(p_t, p_comp, t)
 
         # 시점 t의 Poisson 분포 사용
         poisson_probs_t = self.poisson_probs_by_t[t]
@@ -291,7 +378,8 @@ class RolloutPolicy(BasePolicy):
                  base_policy: BasePolicy,
                  n_simulations: int = 100,
                  rollout_depth: int = 10,
-                 seed: int = None):
+                 seed: int = None,
+                 verbose: bool = False):
         """
         Args:
             model: AirlinePricingModel 인스턴스
@@ -299,12 +387,14 @@ class RolloutPolicy(BasePolicy):
             n_simulations: 각 행동당 시뮬레이션 횟수
             rollout_depth: 시뮬레이션 깊이 (K 스텝)
             seed: 난수 시드
+            verbose: 진행 상황 출력 여부
         """
         self.model = model
         self.base_policy = base_policy
         self.n_simulations = n_simulations
         self.rollout_depth = rollout_depth
         self.rng = np.random.default_rng(seed)
+        self.verbose = verbose
 
     def select_action(self, state: int, t: int) -> float:
         """
@@ -313,6 +403,9 @@ class RolloutPolicy(BasePolicy):
         모든 가능한 가격에 대해 rollout 시뮬레이션을 수행하고,
         평균 수익이 가장 높은 가격을 반환한다.
         """
+        if self.verbose:
+            print(f"\r  Rollout step t={t}/{self.model.num_stages-1}, state={state}", end="", flush=True)
+
         if state == 0:
             return float(self.model.action_space[0])
 
@@ -355,6 +448,9 @@ class RolloutPolicy(BasePolicy):
 
             current_t = t + step
 
+            if current_t >= self.model.num_stages:
+                break
+
             # 첫 스텝: 평가할 action 사용, 이후: base_policy 사용
             if step == 0:
                 p_t = first_action
@@ -366,3 +462,40 @@ class RolloutPolicy(BasePolicy):
             c_t = result['c_next']
 
         return total_reward
+
+
+# ========== 유틸리티 함수 ==========
+def generate_policy_table(policy: BasePolicy, model, verbose: bool = False) -> np.ndarray:
+    """
+    임의의 정책에서 정책 테이블 생성
+
+    모든 (t, c) 상태에서 select_action()을 호출하여 테이블 생성.
+    DP 정책은 이미 테이블이 있으므로 그대로 반환.
+
+    Args:
+        policy: BasePolicy 인스턴스
+        model: AirlinePricingModel 인스턴스
+        verbose: 진행 상황 출력 여부
+
+    Returns:
+        policy_table: (T, num_seats+1) 크기의 정책 테이블
+    """
+    # DP 정책은 이미 테이블이 있음
+    if hasattr(policy, 'policy_table') and policy.policy_table is not None:
+        return policy.policy_table
+
+    T = model.num_stages
+    nS = model.num_seats + 1
+
+    policy_table = np.zeros((T, nS))
+
+    for t in range(T):
+        if verbose and t % 10 == 0:
+            print(f"  Generating policy table: t={t}/{T-1}")
+        for c in range(nS):
+            policy_table[t, c] = policy.select_action(c, t)
+
+    if verbose:
+        print("  Policy table generation completed.")
+
+    return policy_table

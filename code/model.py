@@ -27,12 +27,15 @@ class AirlinePricingModel:
         price_max: float = 1000.0,
         price_step: float = 100.0,
         # Demand Model 관련
-        demand_multiplier: float = 2.5,
-        demand_beta: float = 0.03,
+        total_expected_demand: float = None,  # 총 기대 도착 수 (직접 지정)
+        demand_multiplier: float = 2.5,       # total_expected_demand 미지정 시 사용
+        demand_beta: float = 0.0,             # 수요 증가율 (0이면 균일 수요)
         v_me: float = 5.0,
         v_comp: float = 4.5,
         v_no_buy: float = 1.0,
         beta: float = 0.01,
+        beta_final: float = None,     # 최종 가격 민감도 (t=T-1), None이면 beta와 동일
+        beta_decay: float = 0.0,      # 가격 민감도 감소 속도 (0이면 감소 없음)
         p_comp_min: float = 5.0,
         p_comp_max: float = 15.0,
     ):
@@ -43,12 +46,15 @@ class AirlinePricingModel:
             price_min: 최소 가격
             price_max: 최대 가격
             price_step: 가격 단위
-            demand_multiplier: 지수 수요 모델의 총 수요 배수 (A = num_seats * multiplier)
-            demand_beta: 지수 수요 모델의 감쇠율
+            total_expected_demand: 총 기대 도착 수 (직접 지정)
+            demand_multiplier: 총 수요 배수 (total_expected_demand 미지정 시 사용)
+            demand_beta: 수요 증가율 (0이면 균일 수요, >0이면 후반에 수요 증가)
             v_me: 자사 기본 효용
             v_comp: 경쟁사 기본 효용
             v_no_buy: 미구매 효용
-            beta: 가격 민감도
+            beta: 초기 가격 민감도 (t=0)
+            beta_final: 최종 가격 민감도 (t=T-1), None이면 beta와 동일 (감소 없음)
+            beta_decay: 가격 민감도 감소 속도 (0이면 감소 없음, 클수록 빨리 감소)
             p_comp_min: 경쟁사 최소 가격 (t=0)
             p_comp_max: 경쟁사 최대 가격 (t=T-1)
         """
@@ -61,13 +67,20 @@ class AirlinePricingModel:
         self.price_max = price_max
         self.price_step = price_step
 
-        # Demand Model 관련 (지수 수요 모델)
+        # Demand Model 관련
+        # 총 기대 도착 수: 직접 지정하거나, 좌석 수 * multiplier로 계산
+        if total_expected_demand is not None:
+            self.total_expected_demand = total_expected_demand
+        else:
+            self.total_expected_demand = num_seats * demand_multiplier
         self.demand_multiplier = demand_multiplier
         self.demand_beta = demand_beta
         self.v_me = v_me
         self.v_comp = v_comp
         self.v_no_buy = v_no_buy
-        self.beta = beta
+        self.beta = beta  # 초기 가격 민감도 (t=0)
+        self.beta_final = beta_final if beta_final is not None else beta  # 최종 가격 민감도
+        self.beta_decay = beta_decay  # 감소 속도
         self.p_comp_min = p_comp_min
         self.p_comp_max = p_comp_max
 
@@ -82,23 +95,26 @@ class AirlinePricingModel:
 
     def _precompute_daily_demand(self):
         """
-        지수 수요 모델: 일별 기대 도착 수 사전 계산
+        일별 기대 도착 수 사전 계산
+
+        demand_beta=0: 균일 수요 (매일 동일)
+        demand_beta>0: 지수 수요 (후반에 수요 증가)
 
         cumulative(t) = A * exp(-demand_beta * (T - t))
         daily_demand[t] = cumulative(t+1) - cumulative(t)
-
-        t=0이 판매 시작, t=T-1이 출발 직전 (수요가 가장 높음)
         """
         T = self.num_stages
-        A = self.num_seats * self.demand_multiplier
+        A = self.total_expected_demand
 
-        # t=0 (T일 전) ~ t=T (출발일)
-        # 남은 일수: T-t (t=0이면 T일 남음, t=T이면 0일 남음)
-        t_remaining = np.arange(T, -1, -1)  # [T, T-1, ..., 1, 0]
-        cumulative = A * np.exp(-self.demand_beta * t_remaining)
-
-        # 일별 수요: cumulative[t+1] - cumulative[t]
-        self.daily_demand = np.diff(cumulative)  # 길이: T
+        if self.demand_beta == 0:
+            # 균일 수요: 매일 동일한 도착률
+            mu = A / T
+            self.daily_demand = np.full(T, mu)
+        else:
+            # 지수 수요 모델: 후반에 수요 증가
+            t_remaining = np.arange(T, -1, -1)  # [T, T-1, ..., 1, 0]
+            cumulative = A * np.exp(-self.demand_beta * t_remaining)
+            self.daily_demand = np.diff(cumulative)
 
     def get_expected_arrivals(self, t: int) -> float:
         """
@@ -114,12 +130,37 @@ class AirlinePricingModel:
             return 0.0
         return float(self.daily_demand[t])
 
+    # ========== 시간별 가격 민감도 ==========
+    def get_beta(self, t: int) -> float:
+        """
+        시점 t의 가격 민감도 반환 (지수적 감소)
+
+        beta(t) = beta_final + (beta - beta_final) * exp(-beta_decay * t / T)
+
+        - t=0: beta (초기값, 높은 민감도)
+        - t=T-1: beta_final에 수렴 (낮은 민감도)
+        - beta_decay=0: 감소 없음 (항상 beta)
+
+        Args:
+            t: 현재 시점 (0 ~ num_stages-1)
+
+        Returns:
+            시점 t의 가격 민감도
+        """
+        if self.beta_decay == 0 or self.beta == self.beta_final:
+            return self.beta
+
+        T = self.num_stages
+        ratio = t / max(1, T - 1)
+        decay_factor = np.exp(-self.beta_decay * ratio)
+        return self.beta_final + (self.beta - self.beta_final) * decay_factor
+
     # ========== Competitor Price (동적 경쟁사 가격) ==========
     def get_competitor_price(self, t: int, rng: np.random.Generator = None) -> float:
         """
         시간 t에 따른 경쟁사 가격 반환
 
-        기본 가격: 선형 증가 (p_comp_min → p_comp_max)
+        기본 가격: 지수 증가 (p_comp_min → p_comp_max)
         노이즈: rng가 주어지면 Exponential 노이즈 추가
 
         Args:
@@ -129,8 +170,9 @@ class AirlinePricingModel:
         Returns:
             경쟁사 가격 (p_comp_min ~ p_comp_max 범위)
         """
-        # 선형 증가: t=0에서 min, t=T-1에서 max
-        base = self.p_comp_min + (self.p_comp_max - self.p_comp_min) * (t / max(1, self.num_stages - 1))
+        # 지수 증가: t=0에서 min, t=T-1에서 max
+        ratio = t / max(1, self.num_stages - 1)
+        base = self.p_comp_min * (self.p_comp_max / self.p_comp_min) ** ratio
 
         if rng is not None:
             # 평균 0인 노이즈 (exponential - mean)
@@ -144,7 +186,7 @@ class AirlinePricingModel:
     # ========== Exogenous Information (Demand Model) ==========
     def sample_arrivals(self, rng: np.random.Generator, t: int = None) -> int:
         """
-        도착 고객 수 샘플링 (Poisson with time-varying mean)
+        도착 고객 수 샘플링 (Poisson)
 
         Args:
             rng: 난수 생성기
@@ -156,11 +198,11 @@ class AirlinePricingModel:
         if t is not None:
             mu_t = self.get_expected_arrivals(t)
         else:
-            # 하위 호환성: 전체 평균
+            # 전체 평균 사용
             mu_t = np.mean(self.daily_demand)
         return rng.poisson(mu_t)
 
-    def purchase_probability(self, p_t: float, p_comp: float = None) -> float:
+    def purchase_probability(self, p_t: float, p_comp: float = None, t: int = None) -> float:
         """
         다항 로짓 모델: 자사 구매 확률 계산
         P(buy_me) = exp(U_me) / (exp(U_me) + exp(U_comp) + exp(U_no_buy))
@@ -168,13 +210,17 @@ class AirlinePricingModel:
         Args:
             p_t: 자사 가격
             p_comp: 경쟁사 가격 (None이면 p_comp_min과 p_comp_max의 중간값 사용)
+            t: 현재 시점 (None이면 기본 beta 사용, 지정하면 시간별 beta 사용)
         """
         if p_comp is None:
             # 하위 호환성: 기본값은 중간 가격
             p_comp = (self.p_comp_min + self.p_comp_max) / 2
 
-        U_me = self.v_me - self.beta * p_t
-        U_comp = self.v_comp - self.beta * p_comp
+        # 시간별 가격 민감도
+        beta_t = self.get_beta(t) if t is not None else self.beta
+
+        U_me = self.v_me - beta_t * p_t
+        U_comp = self.v_comp - beta_t * p_comp
         U_no_buy = self.v_no_buy
 
         # 수치 안정성을 위한 max 빼기
@@ -185,9 +231,9 @@ class AirlinePricingModel:
 
         return exp_me / (exp_me + exp_comp + exp_no)
 
-    def compute_demand(self, p_t: float, M_t: int, p_comp: float = None) -> float:
+    def compute_demand(self, p_t: float, M_t: int, p_comp: float = None, t: int = None) -> float:
         """수요 계산: Q_t = M_t * P(buy_me)"""
-        prob = self.purchase_probability(p_t, p_comp)
+        prob = self.purchase_probability(p_t, p_comp, t)
         return M_t * prob
 
     # ========== Transition Function ==========
@@ -231,7 +277,7 @@ class AirlinePricingModel:
 
         # 시간별 기대 도착 수로 샘플링
         M_t = self.sample_arrivals(rng, t)
-        Q_t = self.compute_demand(p_t, M_t, p_comp)
+        Q_t = self.compute_demand(p_t, M_t, p_comp, t)
         s_t = self.compute_sales(Q_t, c_t)
         r_t = self.compute_reward(p_t, s_t)
         c_next = self.transition(c_t, s_t)
